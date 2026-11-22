@@ -50,6 +50,7 @@ from .protocol_ble import (
     ScentMarketingGwProtocol,
     ScentMarketingGwXorProtocol,
     AromelyAroMaxProtocol,
+    ScentMasterProtocol,
     ScentTechProtocol,
     AiDiffuserProtocol,
     get_protocol,
@@ -294,6 +295,7 @@ class ScentDiffuserDevice:
             DeviceType.SCENT_MARKETING_GW: "Scent Marketing (GW)",
             DeviceType.SCENT_MARKETING_GW_XOR: "Scent Marketing (GW, encrypted)",
             DeviceType.AROMELY_ARO_MAX: "Aromely Aro Max",
+            DeviceType.SCENT_MASTER: "Scent Master Pro",
             DeviceType.SCENT_TECH: "Scent Tech / ScentLab",
             DeviceType.AI_DIFFUSER: "AI-Diffuser",
         }
@@ -714,6 +716,32 @@ class ScentDiffuserDevice:
                     except (BleakError, asyncio.TimeoutError, OSError) as err:
                         _LOGGER.warning(
                             "Aromely Aro Max handshake failed on %s: %s",
+                            self._ble_name, err,
+                        )
+                        await self._teardown_ble_client()
+                        self._ble_last_failure_ts = loop.time()
+                        return False
+
+                # Scent Master Pro (the OEM family behind the app) — the app
+                # opens with a session-start frame, syncs the clock and reads
+                # the schedule block, the working level and the mode. Mirrored
+                # here so HA starts from what the unit actually holds. The
+                # anti-clone frame is not needed for control.
+                if isinstance(self._protocol, ScentMasterProtocol):
+                    try:
+                        await self._ble_send(self._protocol.build_session_start())
+                        await asyncio.sleep(0.2)
+                        sm_time = self._protocol.build_time_sync()
+                        if sm_time:
+                            await self._ble_send(sm_time)
+                            await asyncio.sleep(0.2)
+                            self._ble_has_synced_time = True
+                        for frame in self._protocol.build_read_queries():
+                            await self._ble_send(frame)
+                            await asyncio.sleep(0.15)
+                    except (BleakError, asyncio.TimeoutError, OSError) as err:
+                        _LOGGER.warning(
+                            "Scent Master handshake failed on %s: %s",
                             self._ble_name, err,
                         )
                         await self._teardown_ble_client()
@@ -1466,7 +1494,7 @@ class ScentDiffuserDevice:
         return False
 
     async def set_level(self, level: int) -> bool:
-        """Set Scentiment spray intensity (1-3)."""
+        """Set spray intensity (Scentiment 1-3, Scent Master 1-2)."""
         if not isinstance(self._protocol, ScentimentProtocol) or not self._ble_address:
             return False
         cmd = self._protocol.build_set_level(level)
@@ -1777,6 +1805,15 @@ class ScentDiffuserDevice:
                 )
                 cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
 
+            elif isinstance(self._protocol, ScentMasterProtocol):
+                # Schedule 1 of the five the app calls modes; the enable flag
+                # lives in its own register (0x11), so it rides along.
+                slot = ScheduleSlot(
+                    start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
+                    enabled=enabled, work_seconds=work, pause_seconds=pause,
+                )
+                cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
+
             elif isinstance(self._protocol, AiDiffuserProtocol):
                 # The set_schedule service: every field of the slot is given
                 # except gear/pump (and the days, when not passed), so take
@@ -1834,6 +1871,8 @@ class ScentDiffuserDevice:
         """
         if isinstance(self._protocol, AiDiffuserProtocol) and self._ble_address:
             return await self._set_ai_diffuser_slot(slot, **changes)
+        if isinstance(self._protocol, ScentMasterProtocol) and self._ble_address:
+            return await self._set_scent_master_slot(slot, **changes)
         if not isinstance(self._protocol, ScentTechProtocol) or not self._ble_address:
             return False
         async with self._timer_write_lock:
@@ -1873,6 +1912,65 @@ class ScentDiffuserDevice:
                 return True
             except (BleakError, asyncio.TimeoutError, OSError) as err:
                 _LOGGER.warning("Scent Tech timer write failed on %s: %s", self._ble_name, err)
+                self._ble_last_failure_ts = asyncio.get_event_loop().time()
+                async with self._ble_lock:
+                    await self._teardown_ble_client(reason="write-failure")
+                return False
+
+    async def _set_scent_master_slot(self, slot: int, **changes) -> bool:
+        """Edit one of the five Scent Master schedules.
+
+        The firmware stores each schedule as one record (day mask, window,
+        work/pause) plus a separate enabled flag in its own register, so an
+        edit writes the record and, when the flag is part of the change, the
+        `11`..`15` register too. Success requires the read-back to match.
+        """
+        proto = self._protocol
+        if not isinstance(proto, ScentMasterProtocol):
+            return False
+        if "weekdays" in changes and changes["weekdays"] is not None:
+            # The family's mask is bits 0..6; the shared entity sets bit 7 as
+            # the apps' "at least one day" marker.
+            changes["weekdays"] = changes["weekdays"] & 0x7F
+        async with self._timer_write_lock:
+            if not await self._ble_connect():
+                return False
+            try:
+                timer = (self._state.timer_slots or {}).get(slot)
+                if timer is None:
+                    if not await self._ble_execute(proto.build_query()):
+                        return False
+                    await asyncio.sleep(0.4)
+                    timer = (self._state.timer_slots or {}).get(slot)
+                if timer is None:
+                    _LOGGER.warning(
+                        "Scent Master %s: schedule %s not available for writing",
+                        self._ble_name, slot,
+                    )
+                    return False
+                updated = timer.with_changes(**changes)
+                if not (0 <= updated.start_minute <= 1439 and 0 <= updated.stop_minute <= 1439):
+                    _LOGGER.warning("Scent Master %s: times must be within one day", self._ble_name)
+                    return False
+                if not await self._ble_execute(proto.build_slot_frame(slot, updated)):
+                    return False
+                if "enabled" in changes or updated.enabled != timer.enabled:
+                    await self._ble_execute(proto.build_slot_enable(slot, updated.enabled))
+                await asyncio.sleep(0.4)
+                await self._ble_execute(proto.build_query())
+                await asyncio.sleep(0.4)
+                confirmed = (self._state.timer_slots or {}).get(slot)
+                if confirmed != updated:
+                    _LOGGER.warning(
+                        "Scent Master %s: schedule %s write not confirmed by read-back",
+                        self._ble_name, slot,
+                    )
+                    return False
+                return True
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.warning(
+                    "Scent Master schedule write failed on %s: %s", self._ble_name, err,
+                )
                 self._ble_last_failure_ts = asyncio.get_event_loop().time()
                 async with self._ble_lock:
                     await self._teardown_ble_client(reason="write-failure")
