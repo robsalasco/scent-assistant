@@ -1244,6 +1244,10 @@ class ScentMasterProtocol(BleProtocol):
             return
         self.slot = active.serial
         result["schedule_enabled"] = active.enabled
+        # No power register on these units: an enabled schedule is the closest
+        # thing to "running" the firmware reports, so the status sensor is not
+        # stuck on "unknown".
+        result["phase"] = "idle" if active.enabled else "off"
         result["weekday_mask"] = active.weekdays
         result["start_hour"], result["start_minute"] = divmod(active.start_minute, 60)
         result["end_hour"], result["end_minute"] = divmod(active.stop_minute, 60)

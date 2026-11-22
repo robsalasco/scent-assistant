@@ -125,6 +125,7 @@ class ScentMasterParseTests(unittest.TestCase):
             self.assertEqual(first.enabled, True)
             self.assertEqual(state["timer_slots"][2].enabled, False)
             self.assertEqual(state["schedule_enabled"], True)
+            self.assertEqual(state["phase"], "idle")
             self.assertEqual(state["weekday_mask"], 0x52)
             self.assertEqual((state["start_hour"], state["start_minute"]), (11, 0))
             self.assertEqual((state["end_hour"], state["end_minute"]), (19, 0))
